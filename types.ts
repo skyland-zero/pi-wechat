@@ -8,6 +8,8 @@ export interface Credentials {
 
 export interface BaseInfo {
   channel_version: string
+  /** UA 风格的自声明客户端标识，形如 `Product/Version`。 */
+  bot_agent?: string
 }
 
 export enum MessageType {
@@ -26,7 +28,9 @@ export enum MessageItemType {
   IMAGE = 2,
   VOICE = 3,
   FILE = 4,
-  VIDEO = 5
+  VIDEO = 5,
+  TOOL_CALL_START = 11,
+  TOOL_CALL_RESULT = 12
 }
 
 export interface TextItem {
@@ -49,13 +53,33 @@ export interface VideoItem {
   url?: string
 }
 
+/** 工具调用开始（微信端的进度气泡）。 */
+export interface ToolCallStartItem {
+  tool_name: string
+  tool_call_id?: string
+}
+
+export type ToolCallStatus = 'completed' | 'failed' | 'blocked' | 'unknown'
+
+/** 工具调用结束。 */
+export interface ToolCallResultItem {
+  tool_name: string
+  tool_call_id?: string
+  status: ToolCallStatus
+}
+
 export interface MessageItem {
   type: MessageItemType
+  /** 部分 item 类型需要，用于微信端展示时序。 */
+  create_time_ms?: number
+  is_completed?: boolean
   text_item?: TextItem
   image_item?: ImageItem
   voice_item?: VoiceItem
   file_item?: FileItem
   video_item?: VideoItem
+  tool_call_start_item?: ToolCallStartItem
+  tool_call_result_item?: ToolCallResultItem
 }
 
 export interface WeixinMessage {
@@ -79,6 +103,7 @@ export interface GetUpdatesResp {
   ret: number
   msgs: WeixinMessage[]
   get_updates_buf: string
+  /** 服务端下发的长轮询保持时长，应作为下一次轮询的超时值。 */
   longpolling_timeout_ms?: number
   errcode?: number
   errmsg?: string

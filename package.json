@@ -15,7 +15,8 @@
     "url": "https://github.com/yangyang0507/pi-wechat/issues"
   },
   "scripts": {
-    "check": "tsx --tsconfig tsconfig.json -e \"await import('./index.ts')\"",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && tsx --tsconfig tsconfig.json -e \"await import('./index.ts')\"",
     "prepack": "npm run check"
   },
   "keywords": [
@@ -50,7 +51,8 @@
     "@mariozechner/pi-coding-agent": "*",
     "@types/node": "^22.10.5",
     "@types/qrcode-terminal": "^0.12.2",
-    "tsx": "^4.20.3"
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0"
