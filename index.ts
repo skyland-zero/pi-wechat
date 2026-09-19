@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@mariozechner/pi-coding-agent'
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent'
 import qrcode from 'qrcode-terminal'
 import { DEFAULT_BASE_URL } from './api.js'
 import {
@@ -223,8 +223,22 @@ export default function wechatExtension(pi: ExtensionAPI) {
     drainQueue()
   }
 
+  /**
+   * 向运行时确认是否仍在运行。
+   *
+   * `agentIdle` 是扩展自己的记账；`ctx.isIdle()` 是运行时的权威判断，
+   * 这里再确认一次，避免在流式过程中注入消息。
+   */
+  function isRuntimeBusy(): boolean {
+    try {
+      return latestContext ? !latestContext.isIdle() : false
+    } catch {
+      return false
+    }
+  }
+
   function drainQueue(): void {
-    if (!running || !client || !agentIdle || pendingInjection || activeRequest) {
+    if (!running || !client || !agentIdle || isRuntimeBusy() || pendingInjection || activeRequest) {
       return
     }
 
@@ -235,11 +249,15 @@ export default function wechatExtension(pi: ExtensionAPI) {
 
     pendingInjection = next
     void client.sendTyping(next.userId).catch(() => {})
-    pi.sendUserMessage(next.text)
+    // deliverAs 仅作为兜底：agent 空闲时该选项会被忽略，
+    // 万一仍处于流式状态，则改为排队而不是抛错丢弃消息。
+    pi.sendUserMessage(next.text, { deliverAs: 'followUp' })
   }
 
   async function completeActiveRequest(messages: Array<{ role?: string; content?: unknown }>): Promise<void> {
-    const request = activeRequest
+    // 兜底：若消息已注入但 agent_start 未触发（例如被 pi 当作 follow-up 排队），
+    // activeRequest 仍为空，此时用 pendingInjection 补位，避免回复丢失。
+    const request = activeRequest ?? pendingInjection
     activeRequest = null
     pendingInjection = null
     clearIdleFlush()
@@ -276,6 +294,11 @@ export default function wechatExtension(pi: ExtensionAPI) {
     } finally {
       await activeClient.stopTyping(request.userId).catch(() => {})
       resetDelivery()
+      // 兜底：若运行时已确认空闲（例如宿主未派发 agent_settled），
+      // 这里直接恢复出队，避免队列停滞。
+      if (!isRuntimeBusy()) {
+        agentIdle = true
+      }
       drainQueue()
     }
   }
@@ -689,8 +712,17 @@ export default function wechatExtension(pi: ExtensionAPI) {
 
   pi.on('agent_end', async (event, ctx) => {
     rememberContext(ctx)
-    agentIdle = true
+    // 注意：这里不把 agentIdle 置为 true。agent_end 之后 pi 仍可能
+    // 自动重试、自动压缩后重试，或继续执行已排队的跟进消息，
+    // 真正的空闲信号是 agent_settled。
     await completeActiveRequest(event.messages as Array<{ role?: string; content?: unknown }>)
+  })
+
+  /** agent 已完全稳定（无重试/压缩/排队跟进），此时才允许注入下一条消息。 */
+  pi.on('agent_settled', async (_event, ctx) => {
+    rememberContext(ctx)
+    agentIdle = true
+    drainQueue()
   })
 
   pi.on('session_shutdown', async (_event, ctx) => {

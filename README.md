@@ -217,6 +217,18 @@ When a WeChat message arrives:
 
 `agent_end` is still used instead of `turn_end`, because `turn_end` can prematurely send intermediate results when the assistant calls tools.
 
+### Injection is gated on `agent_settled`
+
+`agent_end` only means the current low-level run ended. Pi may still auto-retry, auto-compact and retry,
+or continue with queued follow-up messages — the session is still streaming.
+
+A new WeChat message is therefore injected only after `agent_settled` (no retry, compaction, or follow-up left).
+Every injection also passes `deliverAs: 'followUp'`, so even a race queues the message instead of throwing
+and losing it.
+
+> If you see `Agent is already processing. Specify streamingBehavior ('steer' or 'followUp')`,
+> the installed extension is stale (<= 8a8f7b5). Update it.
+
 ### L2 read-only tool filter
 
 A single agent turn can call `read` / `grep` a dozen times; reporting all of them would burn the rate-limit quota.

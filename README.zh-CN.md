@@ -216,6 +216,17 @@ sync.json              getUpdates 游标（用于重启续传）
 
 `agent_end` 仍不用 `turn_end`，因为 assistant 中途调用工具时，`turn_end` 容易把中间结果过早发回微信。
 
+### 注入时机：只认 `agent_settled`
+
+`agent_end` 只代表本轮底层运行结束。之后 pi 仍可能自动重试、自动压缩后重试，
+或继续执行已排队的跟进消息——此时仍然处于流式状态。
+
+因此下一条微信消息只在 `agent_settled`（无重试/压缩/跟进残留）后注入。
+此外每次注入都带 `deliverAs: 'followUp'`，即使发生竞态也只会排队，不会报错丢失消息。
+
+> 如果你看到 `Agent is already processing. Specify streamingBehavior ('steer' or 'followUp')`，
+> 说明扩展版本过旧（≤ 8a8f7b5）。更新即可。
+
 ### L2 只读工具过滤
 
 一次 agent 轮次里 `read` / `grep` 这类调用可能十几次，全发会直接吃满频率配额。
