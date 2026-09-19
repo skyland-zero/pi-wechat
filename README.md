@@ -4,6 +4,8 @@ English | [简体中文](./README.zh-CN.md)
 
 `pi-wechat` is a TypeScript extension for [pi](https://github.com/badlogic/pi-mono) that bridges WeChat iLink Bot conversations into a pi session.
 
+Requires Pi `>=0.85.0` (the extension uses the `agent_settled` lifecycle event).
+
 It lets you:
 
 - log in to WeChat iLink Bot with a QR code
@@ -27,9 +29,9 @@ Current scope:
 
 - stable text message bridge
 - login persistence with automatic credential backup
-- getUpdates cursor persistence (resumes after restart, no duplicate delivery)
+- getUpdates cursor and durable inbox persistence (resumes after restart; crash recovery favors at-least-once delivery)
 - session-expiry cooldown, poll backoff, and rate-limit backoff
-- outbound message throttling
+- outbound message throttling with a durable outbox and stable retry IDs
 - typing indicator support (typing_ticket with TTL)
 
 Current limitations:
@@ -40,6 +42,8 @@ Current limitations:
 - the WeChat side rate-limits aggressively: roughly **7 messages / 5 minutes**, shared across **all clients of that bot account**
 - group chats are not supported (the protocol declares direct chats only)
 - proactive delivery is limited; an idle channel may be silently disconnected by the server
+- do not run the same credentials in multiple Pi processes; each process should own its bot account
+- by default only the WeChat user from the login credentials is accepted; shared multi-user access additionally requires explicit opt-in
 
 ## Install
 
@@ -122,11 +126,33 @@ credentials.json       current credentials
 credentials.json.bak   automatic backup, written before each overwrite
 tokens.json            token history, used to detect the "already bound" state
 sync.json              getUpdates cursor, used to resume after restarts
+pause.json             persistent session cooldown
+inbox.json             durable inbound queue, committed before cursor advance
+outbox.json            durable outbound messages with stable client IDs (crash recovery is at-least-once)
 ```
 
 > ⚠️ The WeChat side currently offers **no way to unbind**. If `credentials.json` and its backup are both
 > lost while the server still considers the bot bound, re-scanning may fail permanently. Do not delete
 > `~/.pi-wechat/` casually.
+
+### User allowlist and security
+
+Bridge messages are sent to the current Pi coding agent, so a WeChat message may invoke tools enabled in that session.
+By default only the `ilink_user_id` from the login credentials is accepted; other senders are discarded.
+The allowlist is authorization, not separate conversation/tool isolation. A list with multiple users is rejected by default;
+only enable it for trusted users with `PI_WECHAT_ALLOW_SHARED_SESSION=1`.
+To configure one allowed user (or explicitly opt into a shared session), use:
+
+```bash
+PI_WECHAT_ALLOWED_USERS="user-id-1" pi
+```
+
+Switching to a different bot account in the same Pi session is also rejected by default;
+use `PI_WECHAT_ALLOW_ACCOUNT_SWITCH=1` only when shared history is acceptable.
+
+Use a dedicated Pi session for WeChat. Local terminal input is rejected while a WeChat request is being processed,
+which prevents a local reply from being routed to WeChat. API URLs are restricted to HTTPS WeChat domains by default;
+use `PI_WECHAT_EXTRA_HOSTS="example.com"` only for a controlled custom endpoint.
 
 ### Start the bridge
 
@@ -146,7 +172,8 @@ Run:
 /wechat-stop
 ```
 
-This stops polling and clears in-memory bridge state.
+This stops polling while preserving pending messages for the next `/wechat-start`.
+Use `/wechat-logout` when you intentionally want to clear credentials and queued messages.
 
 ### Check bridge status
 
@@ -166,7 +193,8 @@ Run:
 /wechat-logout
 ```
 
-This stops the bridge and removes `credentials.json` and `sync.json`.
+This stops the bridge, removes the current account's `credentials.json`/`sync.json`, and clears that account's pending inbox records.
+Pending records belonging to other explicitly configured accounts are preserved.
 
 The backup and token history are **kept on purpose**: the server needs the token history to recognize
 that the bot is already bound to this machine, otherwise the next login can stall because the server
@@ -187,14 +215,15 @@ The WeChat side rate-limits the iLink channel. The extension builds in matching 
 
 | Situation | Server / extension behavior |
 | --- | --- |
-| Rate limit (`ret: -2`) | About 7 messages / 5 minutes. The extension throttles outbound sends to a 5s minimum interval and backs off 30s before one retry |
+| Rate limit (`ret: -2`) | About 7 messages / 5 minutes. The extension throttles outbound sends to a 5s minimum interval and retries a message up to 3 times with bounded backoff |
 | Stale session (`errcode: -14`) | The extension **cools the channel down for 1 hour** instead of re-logging in immediately, avoiding repeated risk-control triggers |
 | Long-poll timeout | Treated as normal control flow and retried immediately, not counted as an error |
 | Poll failure | Retry after 2s; back off 30s after 3 consecutive failures |
 | Long-poll duration | Follows the server-provided `longpolling_timeout_ms` |
 
-Long replies are split into multiple messages (2000 characters each), and **every chunk consumes rate-limit quota**.
-Keep the 7 / 5 minutes limit in mind when sending many long replies.
+Long replies are split into multiple messages (4000 characters each), and **every chunk consumes rate-limit quota**.
+Keep the 7 / 5 minutes limit in mind when sending many long replies. By default replies are sent only after the agent settles;
+set `PI_WECHAT_INTERMEDIATE=1` to send intermediate blocks, at the cost of possible duplicates after retries.
 
 ## How Replies Work
 
@@ -210,12 +239,12 @@ When a WeChat message arrives:
 
 | Layer | Behavior | Switch |
 | --- | --- | --- |
-| **L1 block replies** (default) | Each completed assistant message is sent immediately, mirroring the official plugin's "send the text blocks completed between multi-step tool calls in order" | On by default |
+| **L1 block replies** | Intermediate assistant blocks are disabled by default; the final settled reply is sent once to avoid retry duplicates | `PI_WECHAT_INTERMEDIATE=1` |
 | **L2 tool progress** | `TOOL_CALL_START` / `TOOL_CALL_RESULT` progress messages (tool name and status only) | On by default |
 | **L3 block streaming** | Token-level coalescing; flushes at 800 chars or 12s idle | `PI_WECHAT_STREAM=1`, **off by default** |
-| Safety net | `agent_end` only sends the **not-yet-delivered remainder**, never a duplicate | On by default |
+| Safety net | The settled reply is compared with the delivery ledger and only the not-yet-delivered remainder is sent | On by default |
 
-`agent_end` is still used instead of `turn_end`, because `turn_end` can prematurely send intermediate results when the assistant calls tools.
+The extension waits for `agent_settled`; `agent_end` can be followed by retry, compaction, or a queued follow-up.
 
 ### Injection is gated on `agent_settled`
 

@@ -43,6 +43,13 @@ export const LONG_POLL_TIMEOUT_MS = 35_000
 const DEFAULT_API_TIMEOUT_MS = 15_000
 const CONFIG_TIMEOUT_MS = 10_000
 const QR_REQUEST_TIMEOUT_MS = 35_000
+const TRUSTED_HOST_SUFFIXES = ['.weixin.qq.com', '.wechat.com']
+const EXTRA_TRUSTED_HOSTS = new Set(
+  (process.env.PI_WECHAT_EXTRA_HOSTS ?? '')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean)
+)
 
 export interface QrCodeResponse {
   qrcode: string
@@ -85,8 +92,88 @@ export class ApiError extends Error {
   }
 }
 
+function isTrustedHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  return host === 'ilinkai.weixin.qq.com'
+    || host === 'weixin.qq.com'
+    || host === 'wechat.com'
+    || TRUSTED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))
+    || EXTRA_TRUSTED_HOSTS.has(host)
+}
+
+function isPrivateHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
+    return true
+  }
+
+  if (host.includes(':')) {
+    // IPv6 literals are not needed for the official endpoint and are hard to
+    // classify safely without a resolver; reject them rather than risk SSRF.
+    return true
+  }
+
+  const parts = host.split('.')
+  if (parts.length !== 4 || parts.some((part) => !/^\d+$/.test(part))) {
+    return false
+  }
+
+  const octets = parts.map(Number)
+  if (octets.some((octet) => octet < 0 || octet > 255)) {
+    return false
+  }
+
+  return octets[0] === 10
+    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+    || (octets[0] === 192 && octets[1] === 168)
+    || octets[0] === 127
+    || (octets[0] === 169 && octets[1] === 254)
+    || octets.every((octet) => octet === 0)
+}
+
+/**
+ * Validate and normalize a server-provided API base URL.
+ *
+ * The bot token is sent to this origin, so accepting arbitrary HTTP or
+ * credential-bearing URLs here would turn a malformed/compromised redirect
+ * response into a token exfiltration primitive.
+ */
+export function validateBaseUrl(raw: unknown): string {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw new Error('Invalid API base URL')
+  }
+
+  let url: URL
+  try {
+    url = new URL(raw.trim())
+  } catch {
+    throw new Error('Invalid API base URL')
+  }
+
+  if (url.protocol !== 'https:') {
+    throw new Error('API base URL must use HTTPS')
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error('API base URL must not contain credentials, query, or fragment')
+  }
+  if (url.pathname !== '/') {
+    throw new Error('API base URL must not contain a path')
+  }
+  if (url.port && url.port !== '443') {
+    throw new Error('API base URL must use the default HTTPS port')
+  }
+  if (isPrivateHostname(url.hostname)) {
+    throw new Error('API base URL must not target a local or private host')
+  }
+  if (!isTrustedHostname(url.hostname)) {
+    throw new Error('API base URL host is not an approved WeChat endpoint')
+  }
+
+  return url.toString().replace(/\/+$/, '')
+}
+
 function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/+$/, '')
+  return validateBaseUrl(baseUrl)
 }
 
 function buildBaseInfo(): BaseInfo {
@@ -115,7 +202,7 @@ export function buildHeaders(token?: string): Record<string, string> {
     'iLink-App-ClientVersion': ILINK_APP_CLIENT_VERSION
   }
 
-  const trimmed = token?.trim()
+  const trimmed = typeof token === 'string' ? token.trim() : ''
   if (trimmed) {
     headers.Authorization = `Bearer ${trimmed}`
   }
@@ -156,7 +243,18 @@ export function isTimeoutError(error: unknown): boolean {
 
 async function parseJsonResponse<T>(response: Response, label: string): Promise<T> {
   const text = await response.text()
-  const payload = text ? JSON.parse(text) as T : ({} as T)
+  let payload: unknown = {}
+
+  if (text) {
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      throw new ApiError(`${label} returned invalid JSON`, {
+        status: response.status,
+        payload: text.slice(0, 500)
+      })
+    }
+  }
 
   if (!response.ok) {
     const body = payload as { errmsg?: string; errcode?: number } | null
@@ -184,7 +282,7 @@ async function parseJsonResponse<T>(response: Response, label: string): Promise<
     })
   }
 
-  return payload
+  return payload as T
 }
 
 interface RequestOptions {
@@ -276,7 +374,8 @@ export async function getUpdates(
 export async function sendMessage(
   baseUrl: string,
   token: string,
-  msg: SendMessageReq['msg']
+  msg: SendMessageReq['msg'],
+  signal?: AbortSignal
 ): Promise<Record<string, unknown>> {
   return apiPost<Record<string, unknown>>({
     baseUrl,
@@ -284,6 +383,7 @@ export async function sendMessage(
     body: { msg, base_info: buildBaseInfo() },
     token,
     timeoutMs: DEFAULT_API_TIMEOUT_MS,
+    signal,
     label: 'sendMessage'
   })
 }
@@ -292,7 +392,8 @@ export async function getConfig(
   baseUrl: string,
   token: string,
   userId: string,
-  contextToken: string
+  contextToken: string,
+  signal?: AbortSignal
 ): Promise<GetConfigResp> {
   return apiPost<GetConfigResp>({
     baseUrl,
@@ -304,6 +405,7 @@ export async function getConfig(
     },
     token,
     timeoutMs: CONFIG_TIMEOUT_MS,
+    signal,
     label: 'getConfig'
   })
 }
@@ -313,7 +415,8 @@ export async function sendTyping(
   token: string,
   userId: string,
   ticket: string,
-  status: SendTypingReq['status']
+  status: SendTypingReq['status'],
+  signal?: AbortSignal
 ): Promise<Record<string, unknown>> {
   const body: SendTypingReq = {
     ilink_user_id: userId,
@@ -328,6 +431,7 @@ export async function sendTyping(
     body,
     token,
     timeoutMs: CONFIG_TIMEOUT_MS,
+    signal,
     label: 'sendTyping'
   })
 }
